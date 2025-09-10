@@ -2709,6 +2709,7 @@ dependencies = [
  "igvm",
  "igvm_defs",
  "iommufd-ioctls",
+ "kvm-bindings",
  "landlock",
  "libc",
  "linux-loader",
