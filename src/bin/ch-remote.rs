@@ -511,6 +511,10 @@ fn rest_api_do_command(matches: &ArgMatches, socket: &mut UnixStream) -> ApiResu
                     .unwrap()
                     .get_one::<NonZeroU32>("connections")
                     .unwrap_or(&NonZeroU32::new(1).unwrap()),
+                matches
+                    .subcommand_matches("send-migration")
+                    .unwrap()
+                    .get_one::<String>("cert_pem"),
             );
             simple_api_command(socket, "PUT", "send-migration", Some(&send_migration_data))
                 .map_err(Error::HttpApiClient)
@@ -522,6 +526,14 @@ fn rest_api_do_command(matches: &ArgMatches, socket: &mut UnixStream) -> ApiResu
                     .unwrap()
                     .get_one::<String>("receive_migration_config")
                     .unwrap(),
+                matches
+                    .subcommand_matches("receive_migration")
+                    .unwrap()
+                    .get_one::<String>("cert_pem"),
+                matches
+                    .subcommand_matches("receive_migration")
+                    .unwrap()
+                    .get_one::<String>("key_pem"),
             );
             simple_api_command(
                 socket,
@@ -928,7 +940,11 @@ fn coredump_config(destination_url: &str) -> String {
     serde_json::to_string(&coredump_config).unwrap()
 }
 
-fn receive_migration_data(url: &str) -> String {
+fn receive_migration_data(
+    url: &str,
+    cert_pem: Option<&String>,
+    key_pem: Option<&String>,
+) -> String {
     let receive_migration_data = vmm::api::VmReceiveMigrationData {
         receiver_url: url.to_owned(),
         tcp_serial_url: None,
@@ -936,6 +952,8 @@ fn receive_migration_data(url: &str) -> String {
         // are valid. Transmitting specific FD nums via the HTTP API is
         // almost always invalid.
         net_fds: None,
+        cert_pem: cert_pem.cloned(),
+        key_pem: key_pem.cloned(),
     };
 
     serde_json::to_string(&receive_migration_data).unwrap()
@@ -947,6 +965,7 @@ fn send_migration_data(
     downtime: u64,
     migration_timeout: u64,
     connections: NonZeroU32,
+    cert_pem: Option<&String>,
 ) -> String {
     let send_migration_data = vmm::api::VmSendMigrationData {
         destination_url: url.to_owned(),
@@ -954,6 +973,7 @@ fn send_migration_data(
         downtime,
         migration_timeout,
         connections,
+        cert_pem: cert_pem.cloned(),
     };
 
     serde_json::to_string(&send_migration_data).unwrap()

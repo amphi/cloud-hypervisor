@@ -265,6 +265,12 @@ pub struct VmReceiveMigrationData {
     pub tcp_serial_url: Option<String>,
     /// Map with new network FDs on the new host.
     pub net_fds: Option<Vec<RestoredNetConfig>>,
+    /// TLS server certificate (.pem)
+    #[serde(default)]
+    pub cert_pem: Option<String>,
+    /// TLS server key (.pem)
+    #[serde(default)]
+    pub key_pem: Option<String>,
 }
 
 #[derive(Clone, Deserialize, Serialize, Debug)]
@@ -287,6 +293,9 @@ pub struct VmSendMigrationData {
     /// The number of parallel connections for migration
     #[serde(default = "default_connections")]
     pub connections: NonZeroU32,
+    /// TLS root CA certificate (.pem)
+    #[serde(default)]
+    pub cert_pem: Option<String>,
 }
 
 // Default value for downtime the same as qemu.
