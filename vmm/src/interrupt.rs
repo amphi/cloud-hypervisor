@@ -23,20 +23,25 @@ struct InterruptRoute {
     gsi: Option<u32>,
     irq_fd: Option<EventFd>,
     registered: bool,
+    allocator: Arc<Mutex<SystemAllocator>>,
 }
 
 impl InterruptRoute {
-    fn new() -> Result<Self> {
+    fn new(allocator: Arc<Mutex<SystemAllocator>>) -> Result<Self> {
         // The irq_fd must be created eagerly because external components
         // (say, VFIO) need the fd at device initialization time via notifier().
-        Self::new_with_fd(Some(EventFd::new(libc::EFD_NONBLOCK)?))
+        Self::new_with_fd(Some(EventFd::new(libc::EFD_NONBLOCK)?), allocator)
     }
 
-    fn new_with_fd(irq_fd: Option<EventFd>) -> Result<Self> {
+    fn new_with_fd(
+        irq_fd: Option<EventFd>,
+        allocator: Arc<Mutex<SystemAllocator>>,
+    ) -> Result<Self> {
         Ok(InterruptRoute {
             gsi: None,
             irq_fd,
             registered: false,
+            allocator,
         })
     }
 
@@ -136,7 +141,15 @@ impl InterruptRoute {
     }
 }
 
-struct RoutingEntry {
+impl Drop for InterruptRoute {
+    fn drop(&mut self) {
+        if let Some(gsi) = self.gsi {
+            self.allocator.lock().unwrap().free_gsi(gsi).unwrap();
+        }
+    }
+}
+
+pub struct RoutingEntry {
     route: IrqRoutingEntry,
     masked: bool,
 }
@@ -382,7 +395,7 @@ impl MsiInterruptManager {
         let mut irq_routes: HashMap<InterruptIndex, Mutex<InterruptRoute>> =
             HashMap::with_capacity(config.count as usize);
         for i in config.base..config.base + config.count {
-            irq_routes.insert(i, Mutex::new(InterruptRoute::new()?));
+            irq_routes.insert(i, Mutex::new(InterruptRoute::new(self.allocator.clone())?));
         }
 
         Ok(MsiInterruptGroup::new(
@@ -401,7 +414,7 @@ impl InterruptManager for MsiInterruptManager {
         let mut irq_routes: HashMap<InterruptIndex, Mutex<InterruptRoute>> =
             HashMap::with_capacity(config.count as usize);
         for i in config.base..config.base + config.count {
-            irq_routes.insert(i, Mutex::new(InterruptRoute::new()?));
+            irq_routes.insert(i, Mutex::new(InterruptRoute::new(self.allocator.clone())?));
         }
 
         Ok(Arc::new(MsiInterruptGroup::new(
