@@ -2993,10 +2993,11 @@ impl RequestHandler for Vmm {
             event!("vm", "migration-receive-failed");
             self.vm = MaybeVmOwnership::None;
             self.vm_config = None;
-        } else {
-            event!("vm", "migration-receive-finished");
+            return Err(MigratableError::CompleteMigration(anyhow!(
+                "Migration was aborted"
+            )));
         }
-
+        event!("vm", "migration-receive-finished");
         Ok(())
     }
 
