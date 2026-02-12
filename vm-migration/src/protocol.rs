@@ -124,6 +124,7 @@ pub enum Command {
     /// Finalizes the migration without resuming the VM on the destination.
     /// Sent when the source VM was paused at migration time.
     CompletePaused,
+    KeepAlive,
 }
 
 #[repr(C)]
@@ -178,6 +179,10 @@ impl Request {
 
     pub fn abandon() -> Self {
         Self::new(Command::Abandon, 0)
+    }
+
+    pub fn keep_alive() -> Self {
+        Self::new(Command::KeepAlive, 0)
     }
 
     pub fn command(&self) -> Command {
