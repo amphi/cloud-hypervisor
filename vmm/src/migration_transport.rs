@@ -15,6 +15,7 @@ use serde_json;
 use vm_migration::protocol::{Request, Response};
 use vm_migration::{Migratable, MigratableError, Snapshot};
 
+use crate::vm::Vm;
 use crate::{SocketStream, VmMigrationConfig};
 
 /// Extract a UNIX socket path from a "unix:" migration URL.
@@ -137,4 +138,28 @@ pub(crate) fn send_state(
         socket,
         MigratableError::MigrateSend(anyhow!("Error during state migration")),
     )
+}
+
+pub(crate) fn vm_maybe_send_dirty_pages(
+    vm: &mut Vm,
+    socket: &mut SocketStream,
+) -> Result<bool, MigratableError> {
+    // Send (dirty) memory table
+    let table = vm.dirty_log()?;
+
+    // But if there are no regions go straight to pause
+    if table.regions().is_empty() {
+        return Ok(false);
+    }
+
+    Request::memory(table.length()).write_to(socket).unwrap();
+    table.write_to(socket)?;
+    // And then the memory itself
+    vm.send_memory_regions(&table, socket)?;
+    Response::read_from(socket)?.ok_or_abandon(
+        socket,
+        MigratableError::MigrateSend(anyhow!("Error during dirty memory migration")),
+    )?;
+
+    Ok(true)
 }

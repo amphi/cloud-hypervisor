@@ -1151,31 +1151,6 @@ impl Vmm {
         Ok(())
     }
 
-    // Returns true if there were dirty pages to send
-    fn vm_maybe_send_dirty_pages(
-        vm: &mut Vm,
-        socket: &mut SocketStream,
-    ) -> result::Result<bool, MigratableError> {
-        // Send (dirty) memory table
-        let table = vm.dirty_log()?;
-
-        // But if there are no regions go straight to pause
-        if table.regions().is_empty() {
-            return Ok(false);
-        }
-
-        Request::memory(table.length()).write_to(socket).unwrap();
-        table.write_to(socket)?;
-        // And then the memory itself
-        vm.send_memory_regions(&table, socket)?;
-        Response::read_from(socket)?.ok_or_abandon(
-            socket,
-            MigratableError::MigrateSend(anyhow!("Error during dirty memory migration")),
-        )?;
-
-        Ok(true)
-    }
-
     fn send_migration(
         vm: &mut Vm,
         #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
@@ -1271,7 +1246,7 @@ impl Vmm {
             const MAX_DIRTY_MIGRATIONS: usize = 5;
             for i in 0..MAX_DIRTY_MIGRATIONS {
                 info!("Dirty memory migration {i} of {MAX_DIRTY_MIGRATIONS}");
-                if !Self::vm_maybe_send_dirty_pages(vm, &mut socket)? {
+                if !migration_transport::vm_maybe_send_dirty_pages(vm, &mut socket)? {
                     break;
                 }
             }
@@ -1280,7 +1255,7 @@ impl Vmm {
             vm.pause()?;
 
             // Send last batch of dirty pages
-            Self::vm_maybe_send_dirty_pages(vm, &mut socket)?;
+            migration_transport::vm_maybe_send_dirty_pages(vm, &mut socket)?;
         }
 
         // We release the locks early to enable locking them on the destination host.
