@@ -12,11 +12,12 @@ use std::result::Result;
 use anyhow::anyhow;
 use log::info;
 use serde_json;
-use vm_migration::protocol::{Request, Response};
+use vm_memory::{GuestAddress, GuestAddressSpace, GuestMemory, GuestMemoryAtomic};
+use vm_migration::protocol::{MemoryRangeTable, Request, Response};
 use vm_migration::{Migratable, MigratableError, Snapshot};
 
 use crate::vm::Vm;
-use crate::{SocketStream, VmMigrationConfig};
+use crate::{GuestMemoryMmap, SocketStream, VmMigrationConfig};
 
 /// Extract a UNIX socket path from a "unix:" migration URL.
 fn socket_url_to_path(url: &str) -> Result<PathBuf, MigratableError> {
@@ -155,11 +156,48 @@ pub(crate) fn vm_maybe_send_dirty_pages(
     Request::memory(table.length()).write_to(socket).unwrap();
     table.write_to(socket)?;
     // And then the memory itself
-    vm.send_memory_regions(&table, socket)?;
+    send_memory_regions(&vm.guest_memory(), &table, socket)?;
     Response::read_from(socket)?.ok_or_abandon(
         socket,
         MigratableError::MigrateSend(anyhow!("Error during dirty memory migration")),
     )?;
 
     Ok(true)
+}
+
+pub(crate) fn send_memory_regions(
+    guest_memory: &GuestMemoryAtomic<GuestMemoryMmap>,
+    ranges: &MemoryRangeTable,
+    fd: &mut SocketStream,
+) -> Result<(), MigratableError> {
+    let mem = guest_memory.memory();
+
+    for range in ranges.regions() {
+        let mut offset: u64 = 0;
+        // Here we are manually handling the retry in case we can't read the
+        // whole region at once because we can't use the implementation
+        // from vm-memory::GuestMemory of write_all_to() as it is not
+        // following the correct behavior. For more info about this issue
+        // see: https://github.com/rust-vmm/vm-memory/issues/174
+        loop {
+            let bytes_written = mem
+                .write_volatile_to(
+                    GuestAddress(range.gpa + offset),
+                    fd,
+                    (range.length - offset) as usize,
+                )
+                .map_err(|e| {
+                    MigratableError::MigrateSend(anyhow!(
+                        "Error transferring memory to socket: {e}"
+                    ))
+                })?;
+            offset += bytes_written as u64;
+
+            if offset == range.length {
+                break;
+            }
+        }
+    }
+
+    Ok(())
 }

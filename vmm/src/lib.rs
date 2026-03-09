@@ -1236,7 +1236,7 @@ impl Vmm {
                 .unwrap();
             table.write_to(&mut socket)?;
             // And then the memory itself
-            vm.send_memory_regions(&table, &mut socket)?;
+            migration_transport::send_memory_regions(&vm.guest_memory(), &table, &mut socket)?;
             migration_transport::expect_ok_response(
                 &mut socket,
                 MigratableError::MigrateSend(anyhow!("Error during dirty memory migration")),
