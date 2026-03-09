@@ -14,9 +14,8 @@ use log::info;
 use serde_json;
 use vm_memory::{GuestAddress, GuestAddressSpace, GuestMemory, GuestMemoryAtomic};
 use vm_migration::protocol::{MemoryRangeTable, Request, Response};
-use vm_migration::{Migratable, MigratableError, Snapshot};
+use vm_migration::{MigratableError, Snapshot};
 
-use crate::vm::Vm;
 use crate::{GuestMemoryMmap, SocketStream, VmMigrationConfig};
 
 /// Extract a UNIX socket path from a "unix:" migration URL.
@@ -141,37 +140,22 @@ pub(crate) fn send_state(
     )
 }
 
-pub(crate) fn vm_maybe_send_dirty_pages(
-    vm: &mut Vm,
-    socket: &mut SocketStream,
-) -> Result<bool, MigratableError> {
-    // Send (dirty) memory table
-    let table = vm.dirty_log()?;
-
-    // But if there are no regions go straight to pause
-    if table.regions().is_empty() {
-        return Ok(false);
-    }
-
-    Request::memory(table.length()).write_to(socket).unwrap();
-    table.write_to(socket)?;
-    // And then the memory itself
-    send_memory_regions(&vm.guest_memory(), &table, socket)?;
-    Response::read_from(socket)?.ok_or_abandon(
-        socket,
-        MigratableError::MigrateSend(anyhow!("Error during dirty memory migration")),
-    )?;
-
-    Ok(true)
-}
-
+/// Send a memory range table followed by the corresponding memory contents.
 pub(crate) fn send_memory_regions(
     guest_memory: &GuestMemoryAtomic<GuestMemoryMmap>,
     ranges: &MemoryRangeTable,
-    fd: &mut SocketStream,
+    socket: &mut SocketStream,
 ) -> Result<(), MigratableError> {
-    let mem = guest_memory.memory();
+    if ranges.regions().is_empty() {
+        return Ok(());
+    }
 
+    // Send the memory table
+    Request::memory(ranges.length()).write_to(socket).unwrap();
+    ranges.write_to(socket)?;
+
+    // And then the memory itself
+    let mem = guest_memory.memory();
     for range in ranges.regions() {
         let mut offset: u64 = 0;
         // Here we are manually handling the retry in case we can't read the
@@ -183,7 +167,7 @@ pub(crate) fn send_memory_regions(
             let bytes_written = mem
                 .write_volatile_to(
                     GuestAddress(range.gpa + offset),
-                    fd,
+                    socket,
                     (range.length - offset) as usize,
                 )
                 .map_err(|e| {
@@ -199,5 +183,8 @@ pub(crate) fn send_memory_regions(
         }
     }
 
-    Ok(())
+    expect_ok_response(
+        socket,
+        MigratableError::MigrateSend(anyhow!("Error during dirty memory migration")),
+    )
 }
