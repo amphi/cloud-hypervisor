@@ -36,7 +36,6 @@ use signal_hook::iterator::{Handle, Signals};
 use thiserror::Error;
 use tracer::trace_scoped;
 use vm_memory::bitmap::AtomicBitmap;
-use vm_memory::ReadVolatile;
 use vm_migration::protocol::*;
 use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
 use vmm_sys_util::eventfd::EventFd;
@@ -1050,21 +1049,17 @@ impl Vmm {
         Ok(())
     }
 
-    fn vm_receive_memory<T>(
+    fn vm_receive_memory(
         &mut self,
         req: &Request,
-        socket: &mut T,
+        socket: &mut SocketStream,
         memory_manager: &mut MemoryManager,
-    ) -> std::result::Result<(), MigratableError>
-    where
-        T: Read + ReadVolatile,
-    {
-        // Read table
+    ) -> std::result::Result<(), MigratableError> {
+        // Read the memory table
         let table = MemoryRangeTable::read_from(socket, req.length())?;
 
-        // And then read the memory itself
-        memory_manager.receive_memory_regions(&table, socket)?;
-        Ok(())
+        // And then the memory itself
+        migration_transport::receive_memory_regions(&memory_manager.guest_memory(), &table, socket)
     }
 
     fn send_migration(
