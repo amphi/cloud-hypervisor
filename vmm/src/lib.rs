@@ -1069,6 +1069,41 @@ impl Vmm {
         Ok(())
     }
 
+    fn do_memory_migration(
+        vm: &mut Vm,
+        mut socket: &mut SocketStream,
+    ) -> result::Result<(), MigratableError> {
+        migration_transport::send_memory_regions(
+            &vm.guest_memory(),
+            &vm.memory_range_table()?,
+            &mut socket,
+        )?;
+
+        // Try at most 5 passes of dirty memory sending
+        const MAX_DIRTY_MIGRATIONS: usize = 5;
+        for i in 0..MAX_DIRTY_MIGRATIONS {
+            info!("Dirty memory migration {i} of {MAX_DIRTY_MIGRATIONS}");
+            let table = vm.dirty_log()?;
+            if table.regions().is_empty() {
+                break;
+            }
+
+            migration_transport::send_memory_regions(&vm.guest_memory(), &table, &mut socket)?;
+        }
+
+        // Now pause VM
+        vm.pause()?;
+
+        // Send last batch of dirty pages
+        migration_transport::send_memory_regions(
+            &vm.guest_memory(),
+            &vm.dirty_log()?,
+            &mut socket,
+        )?;
+
+        Ok(())
+    }
+
     fn send_migration(
         vm: &mut Vm,
         #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
@@ -1146,34 +1181,7 @@ impl Vmm {
         } else {
             // Start logging dirty pages
             vm.start_dirty_log()?;
-
-            migration_transport::send_memory_regions(
-                &vm.guest_memory(),
-                &vm.memory_range_table()?,
-                &mut socket,
-            )?;
-
-            // Try at most 5 passes of dirty memory sending
-            const MAX_DIRTY_MIGRATIONS: usize = 5;
-            for i in 0..MAX_DIRTY_MIGRATIONS {
-                info!("Dirty memory migration {i} of {MAX_DIRTY_MIGRATIONS}");
-                let table = vm.dirty_log()?;
-                if table.regions().is_empty() {
-                    break;
-                }
-
-                migration_transport::send_memory_regions(&vm.guest_memory(), &table, &mut socket)?;
-            }
-
-            // Now pause VM
-            vm.pause()?;
-
-            // Send last batch of dirty pages
-            migration_transport::send_memory_regions(
-                &vm.guest_memory(),
-                &vm.dirty_log()?,
-                &mut socket,
-            )?;
+            Self::do_memory_migration(vm, &mut socket)?;
         }
 
         // We release the locks early to enable locking them on the destination host.
