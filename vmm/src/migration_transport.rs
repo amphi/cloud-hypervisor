@@ -348,9 +348,14 @@ pub(crate) fn send_memory_regions(
 /// Receive memory contents for the given range table into guest memory.
 pub(crate) fn receive_memory_regions(
     guest_memory: &GuestMemoryAtomic<GuestMemoryMmap>,
-    ranges: &MemoryRangeTable,
+    req: &Request,
     socket: &mut SocketStream,
 ) -> Result<(), MigratableError> {
+    debug_assert_eq!(req.command(), Command::Memory);
+    // Read the memory table
+    let ranges = MemoryRangeTable::read_from(socket, req.length())?;
+
+    // And then the memory itself
     let mem = guest_memory.memory();
 
     for range in ranges.regions() {
