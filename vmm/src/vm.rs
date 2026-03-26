@@ -20,7 +20,6 @@ use std::num::Wrapping;
 use std::ops::Deref;
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
-#[cfg(not(target_arch = "riscv64"))]
 use std::time::Instant;
 use std::{cmp, result, str, thread};
 
@@ -461,9 +460,18 @@ impl VmOps for VmOpsHandler {
                 info!("Guest MMIO write to unregistered address 0x{gpa:x}");
             }
             Ok(Some(barrier)) => {
-                info!("Waiting for barrier");
+                let _waiting_in_mmio_barrier = crate::cpu::ScopedVcpuThreadState::new(
+                    crate::cpu::VcpuThreadState::WaitingInMmioBarrier,
+                );
+                let current_thread = thread::current();
+                let thread_name = current_thread.name().unwrap_or("unknown");
+                let barrier_wait_started = Instant::now();
+                info!("{thread_name} waiting for MMIO barrier at 0x{gpa:x}");
                 barrier.wait();
-                info!("Barrier released");
+                info!(
+                    "{thread_name} MMIO barrier released at 0x{gpa:x} after {:?}",
+                    barrier_wait_started.elapsed()
+                );
             }
             _ => {}
         }
@@ -485,9 +493,18 @@ impl VmOps for VmOpsHandler {
                 info!("Guest PIO write to unregistered address 0x{port:x}");
             }
             Ok(Some(barrier)) => {
-                info!("Waiting for barrier");
+                let _waiting_in_pio_barrier = crate::cpu::ScopedVcpuThreadState::new(
+                    crate::cpu::VcpuThreadState::WaitingInPioBarrier,
+                );
+                let current_thread = thread::current();
+                let thread_name = current_thread.name().unwrap_or("unknown");
+                let barrier_wait_started = Instant::now();
+                info!("{thread_name} waiting for PIO barrier at 0x{port:x}");
                 barrier.wait();
-                info!("Barrier released");
+                info!(
+                    "{thread_name} PIO barrier released at 0x{port:x} after {:?}",
+                    barrier_wait_started.elapsed()
+                );
             }
             _ => {}
         }

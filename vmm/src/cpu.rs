@@ -11,13 +11,14 @@
 // SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 //
 
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use std::io::Write;
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use std::mem::size_of;
 use std::os::unix::thread::JoinHandleExt;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::{cmp, io, result, thread};
 
@@ -81,7 +82,7 @@ use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::signal::{SIGRTMIN, register_signal_handler};
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 #[cfg(feature = "kvm")]
-use {kvm_bindings::kvm_run, std::cell::Cell, std::os::fd::RawFd, std::sync::RwLock};
+use {kvm_bindings::kvm_run, std::os::fd::RawFd, std::sync::RwLock};
 
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use crate::coredump::{
@@ -101,11 +102,125 @@ use crate::{CPU_MANAGER_SNAPSHOT_ID, GuestMemoryMmap};
 thread_local! {
     static KVM_RUN: Cell<*mut kvm_run> = const {Cell::new(core::ptr::null_mut())};
 }
+thread_local! {
+    static VCPU_THREAD_STATE_RAW: Cell<*const AtomicU8> = const { Cell::new(core::ptr::null()) };
+}
+thread_local! {
+    static VCPU_THREAD_STATE: RefCell<Option<Arc<AtomicU8>>> = const { RefCell::new(None) };
+}
 #[cfg(feature = "kvm")]
 /// Tell signal handler to not access certain stuff anymore during shutdown.
 /// Otherwise => panics.
 /// Better alternative would be to prevent signals there at all.
 pub static IS_IN_SHUTDOWN: RwLock<bool> = RwLock::new(false);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub(crate) enum VcpuThreadState {
+    Unknown = 0,
+    Starting = 1,
+    WaitingForStartupBarrier = 2,
+    RunningGuest = 3,
+    CompletingImmediateExit = 4,
+    WaitingInMmioBarrier = 5,
+    WaitingInPioBarrier = 6,
+    Paused = 7,
+    SignalHandlerEntered = 8,
+    CheckingControlFlags = 9,
+}
+
+impl VcpuThreadState {
+    fn from_raw(raw: u8) -> Self {
+        match raw {
+            1 => Self::Starting,
+            2 => Self::WaitingForStartupBarrier,
+            3 => Self::RunningGuest,
+            4 => Self::CompletingImmediateExit,
+            5 => Self::WaitingInMmioBarrier,
+            6 => Self::WaitingInPioBarrier,
+            7 => Self::Paused,
+            8 => Self::SignalHandlerEntered,
+            9 => Self::CheckingControlFlags,
+            _ => Self::Unknown,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Starting => "starting",
+            Self::WaitingForStartupBarrier => "waiting_for_startup_barrier",
+            Self::RunningGuest => "running_guest",
+            Self::CompletingImmediateExit => "completing_immediate_exit",
+            Self::WaitingInMmioBarrier => "waiting_in_mmio_barrier",
+            Self::WaitingInPioBarrier => "waiting_in_pio_barrier",
+            Self::Paused => "paused",
+            Self::SignalHandlerEntered => "signal_handler_entered",
+            Self::CheckingControlFlags => "checking_control_flags",
+        }
+    }
+}
+
+impl std::fmt::Display for VcpuThreadState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+fn register_vcpu_thread_state(thread_state: Arc<AtomicU8>) {
+    VCPU_THREAD_STATE_RAW.with(|state| {
+        state.set(Arc::as_ptr(&thread_state));
+    });
+    VCPU_THREAD_STATE.with(|state| {
+        *state.borrow_mut() = Some(thread_state);
+    });
+}
+
+fn swap_vcpu_thread_state(new_state: VcpuThreadState) -> Option<VcpuThreadState> {
+    VCPU_THREAD_STATE.with(|state| {
+        let state = state.borrow();
+        state.as_ref().map(|thread_state| {
+            VcpuThreadState::from_raw(thread_state.swap(new_state as u8, Ordering::SeqCst))
+        })
+    })
+}
+
+fn set_vcpu_thread_state(new_state: VcpuThreadState) {
+    let _ = swap_vcpu_thread_state(new_state);
+}
+
+fn set_vcpu_thread_state_from_signal_handler(new_state: VcpuThreadState) {
+    VCPU_THREAD_STATE_RAW.with(|state| {
+        let thread_state = state.get();
+        if !thread_state.is_null() {
+            // SAFETY: The pointer comes from an Arc<AtomicU8> stored for the lifetime of the
+            // vCPU thread. We only perform an atomic store through it.
+            unsafe {
+                (*thread_state).store(new_state as u8, Ordering::SeqCst);
+            }
+        }
+    });
+}
+
+pub(crate) struct ScopedVcpuThreadState {
+    previous_state: Option<VcpuThreadState>,
+}
+
+impl ScopedVcpuThreadState {
+    pub(crate) fn new(new_state: VcpuThreadState) -> Self {
+        Self {
+            previous_state: swap_vcpu_thread_state(new_state),
+        }
+    }
+}
+
+impl Drop for ScopedVcpuThreadState {
+    fn drop(&mut self) {
+        if let Some(previous_state) = self.previous_state {
+            let _ = swap_vcpu_thread_state(previous_state);
+        }
+    }
+}
 
 #[cfg(all(target_arch = "aarch64", feature = "guest_debug"))]
 /// Extract the specified bits of a 64-bit integer.
@@ -726,16 +841,33 @@ impl BusDevice for CpuManager {
     }
 }
 
-#[derive(Default)]
 struct VcpuState {
+    id: u32,
     inserting: bool,
     removing: bool,
     pending_removal: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
     kill: Arc<AtomicBool>,
     vcpu_run_interrupted: Arc<AtomicBool>,
+    thread_state: Arc<AtomicU8>,
     /// Used to ACK state changes from the run vCPU loop to the CPU Manager.
     paused: Arc<AtomicBool>,
+}
+
+impl Default for VcpuState {
+    fn default() -> Self {
+        Self {
+            id: 0,
+            inserting: false,
+            removing: false,
+            pending_removal: Arc::new(AtomicBool::new(false)),
+            handle: None,
+            kill: Arc::new(AtomicBool::new(false)),
+            vcpu_run_interrupted: Arc::new(AtomicBool::new(false)),
+            thread_state: Arc::new(AtomicU8::new(VcpuThreadState::Unknown as u8)),
+            paused: Arc::new(AtomicBool::new(false)),
+        }
+    }
 }
 
 impl VcpuState {
@@ -743,17 +875,48 @@ impl VcpuState {
         self.handle.is_some()
     }
 
+    fn id(&self) -> u32 {
+        self.id
+    }
+
+    fn thread_state(&self) -> VcpuThreadState {
+        VcpuThreadState::from_raw(self.thread_state.load(Ordering::SeqCst))
+    }
+
+    fn thread_state_note(&self) -> Option<&'static str> {
+        match self.thread_state() {
+            VcpuThreadState::WaitingInMmioBarrier => {
+                Some("blocked in userspace MMIO barrier wait")
+            }
+            VcpuThreadState::WaitingInPioBarrier => Some("blocked in userspace PIO barrier wait"),
+            _ => None,
+        }
+    }
+
+    fn log_signal_result(&self, context: &str, signal_result: result::Result<(), i32>) {
+        if let Err(errno) = signal_result {
+            warn!(
+                "Failed to signal vCPU {} thread during {context}: errno={errno} ({})",
+                self.id(),
+                io::Error::from_raw_os_error(errno)
+            );
+        }
+    }
+
     /// Sends a signal to the underlying thread.
     ///
     /// Please call [`Self::wait_until_signal_acknowledged`] afterward to block
     /// until the vCPU thread has acknowledged the signal.
-    fn signal_thread(&self) {
+    fn signal_thread(&self) -> result::Result<(), i32> {
         if let Some(handle) = self.handle.as_ref() {
             // SAFETY: FFI call with correct arguments
-            unsafe {
-                libc::pthread_kill(handle.as_pthread_t() as _, SIGRTMIN());
+            let ret = unsafe { libc::pthread_kill(handle.as_pthread_t() as _, SIGRTMIN()) };
+            if ret != 0 {
+                return Err(ret);
             }
         }
+
+        Ok(())
     }
 
     /// Blocks until the vCPU thread has acknowledged the signal. It retries to send
@@ -772,10 +935,38 @@ impl VcpuState {
                 thread::sleep(std::time::Duration::from_millis(1));
                 count += 1;
                 if count >= 1000 {
+                    if let Some(note) = self.thread_state_note() {
+                        error!(
+                            "Timed out waiting for vCPU {} thread to acknowledge signal: state={}, note={note}",
+                            self.id(),
+                            self.thread_state(),
+                        );
+                    } else {
+                        error!(
+                            "Timed out waiting for vCPU {} thread to acknowledge signal: state={}",
+                            self.id(),
+                            self.thread_state(),
+                        );
+                    }
                     return Err(Error::SignalAcknowledgeTimeout);
                 } else if count % 10 == 0 {
-                    warn!("vCPU thread did not respond in {count}ms to signal - retrying");
-                    self.signal_thread();
+                    let signal_result = self.signal_thread();
+                    if let Some(note) = self.thread_state_note() {
+                        warn!(
+                            "vCPU {} thread did not respond in {count}ms to signal - retrying, state={}, pthread_kill={}, note={note}",
+                            self.id(),
+                            self.thread_state(),
+                            if signal_result.is_ok() { "ok" } else { "failed" },
+                        );
+                    } else {
+                        warn!(
+                            "vCPU {} thread did not respond in {count}ms to signal - retrying, state={}, pthread_kill={}",
+                            self.id(),
+                            self.thread_state(),
+                            if signal_result.is_ok() { "ok" } else { "failed" },
+                        );
+                    }
+                    self.log_signal_result("signal acknowledgement retry", signal_result);
                 }
             }
         }
@@ -823,6 +1014,9 @@ impl CpuManager {
         let max_vcpus = usize::try_from(config.max_vcpus).unwrap();
         let mut vcpu_states = Vec::with_capacity(max_vcpus);
         vcpu_states.resize_with(max_vcpus, VcpuState::default);
+        for (vcpu_id, state) in vcpu_states.iter_mut().enumerate() {
+            state.id = u32::try_from(vcpu_id).unwrap();
+        }
         let hypervisor_type = hypervisor.hypervisor_type();
         #[cfg(target_arch = "x86_64")]
         let cpu_vendor = hypervisor.get_cpu_vendor();
@@ -1174,6 +1368,9 @@ impl CpuManager {
         let vcpu_run_interrupted = self.vcpu_states[usize::try_from(vcpu_id).unwrap()]
             .vcpu_run_interrupted
             .clone();
+        let vcpu_thread_state = self.vcpu_states[usize::try_from(vcpu_id).unwrap()]
+            .thread_state
+            .clone();
         let panic_vcpu_run_interrupted = vcpu_run_interrupted.clone();
         let vcpu_paused = self.vcpu_states[usize::try_from(vcpu_id).unwrap()]
             .paused
@@ -1209,6 +1406,9 @@ impl CpuManager {
             thread::Builder::new()
                 .name(format!("vcpu{vcpu_id}"))
                 .spawn(move || {
+                    register_vcpu_thread_state(vcpu_thread_state);
+                    set_vcpu_thread_state(VcpuThreadState::Starting);
+
                     // init thread-local kvm_run structure
                     #[cfg(feature = "kvm")]
                     {
@@ -1283,6 +1483,10 @@ impl CpuManager {
                             return;
                         }
 
+                        set_vcpu_thread_state_from_signal_handler(
+                            VcpuThreadState::SignalHandlerEntered,
+                        );
+
                         let kvm_run = KVM_RUN.get();
                         // SAFETY: the mapping is valid
                         let kvm_run = unsafe {
@@ -1293,10 +1497,17 @@ impl CpuManager {
                     register_signal_handler(SIGRTMIN(), handle_signal)
                         .expect("Failed to register vcpu signal handler");
                     // Block until all CPUs are ready.
-                    vcpu_thread_barrier.wait();
+                    {
+                        let _waiting_for_startup_barrier =
+                            ScopedVcpuThreadState::new(VcpuThreadState::WaitingForStartupBarrier);
+                        vcpu_thread_barrier.wait();
+                    }
+                    set_vcpu_thread_state(VcpuThreadState::Unknown);
 
                     std::panic::catch_unwind(move || {
                         loop {
+                            set_vcpu_thread_state(VcpuThreadState::CheckingControlFlags);
+
                             // If we are being told to pause, we park the thread
                             // until the pause boolean is toggled.
                             // The resume operation is responsible for toggling
@@ -1327,6 +1538,10 @@ impl CpuManager {
 
                                 #[cfg(feature = "kvm")]
                                 if matches!(hypervisor_type, HypervisorType::Kvm) {
+                                    let _completing_immediate_exit_state =
+                                        ScopedVcpuThreadState::new(
+                                            VcpuThreadState::CompletingImmediateExit,
+                                        );
                                     let lock = vcpu.lock();
                                     let mut lock = lock.unwrap();
                                     lock.vcpu.set_immediate_exit(true);
@@ -1339,11 +1554,15 @@ impl CpuManager {
 
                                 vcpu_run_interrupted.store(true, Ordering::SeqCst);
 
-                                vcpu_paused.store(true, Ordering::SeqCst);
-                                while vcpus_pause_signalled.load(Ordering::SeqCst) {
-                                    thread::park();
+                                {
+                                    let _paused_state =
+                                        ScopedVcpuThreadState::new(VcpuThreadState::Paused);
+                                    vcpu_paused.store(true, Ordering::SeqCst);
+                                    while vcpus_pause_signalled.load(Ordering::SeqCst) {
+                                        thread::park();
+                                    }
+                                    vcpu_paused.store(false, Ordering::SeqCst);
                                 }
-                                vcpu_paused.store(false, Ordering::SeqCst);
                                 vcpu_run_interrupted.store(false, Ordering::SeqCst);
                             }
 
@@ -1369,7 +1588,26 @@ impl CpuManager {
 
                             let mut vcpu = vcpu.lock().unwrap();
                             // vcpu.run() returns false on a triple-fault so trigger a reset
-                            match vcpu.run() {
+                            let run_result = {
+                                let _running_guest_state =
+                                    ScopedVcpuThreadState::new(VcpuThreadState::RunningGuest);
+                                vcpu.run()
+                            };
+                            if vcpus_pause_signalled.load(Ordering::SeqCst) {
+                                match &run_result {
+                                    Ok(vm_exit) => {
+                                        warn!(
+                                            "vCPU {vcpu_id} vcpu.run() returned while pause was pending: {vm_exit:?}"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "vCPU {vcpu_id} vcpu.run() returned error while pause was pending: {e:?}"
+                                        );
+                                    }
+                                }
+                            }
+                            match run_result {
                                 Ok(run) => match run {
                                     #[cfg(feature = "kvm")]
                                     VmExit::Debug => {
@@ -1517,7 +1755,7 @@ impl CpuManager {
         info!("Removing vCPU: cpu_id = {cpu_id}");
         let state = &mut self.vcpu_states[usize::try_from(cpu_id).unwrap()];
         state.kill.store(true, Ordering::SeqCst);
-        state.signal_thread();
+        state.log_signal_result("vCPU removal", state.signal_thread());
         state.wait_until_signal_acknowledged()?;
         state.join_thread()?;
         state.handle = None;
@@ -1614,7 +1852,7 @@ impl CpuManager {
         // Splitting this into two loops reduced the time to pause many vCPUs
         // massively. Example: 254 vCPUs. >254ms -> ~4ms.
         for state in self.vcpu_states.iter() {
-            state.signal_thread();
+            state.log_signal_result("broadcast pause signal", state.signal_thread());
         }
         for state in self.vcpu_states.iter() {
             state.wait_until_signal_acknowledged()?;
