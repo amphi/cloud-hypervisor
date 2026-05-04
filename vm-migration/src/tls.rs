@@ -7,11 +7,12 @@
 //!
 //! This module wraps `rustls` to provide a blocking [`TlsStream`] for migration
 //! traffic. [`TlsStream::new_client`] authenticates the server against
-//! `ca-cert.pem` and the expected hostname, and presents `client-cert.pem` and
-//! `client-key.pem` for mutual TLS (mTLS) authentication. [`TlsServerConfig`] loads
-//! `server-cert.pem` and `server-key.pem`, trusts client certificates issued by
-//! the CA in `ca-cert.pem`, and [`TlsStream::new_server`] uses that
-//! configuration to establish the server side of the connection.
+//! `ca-cert.pem` and the expected hostname. If `client-cert.pem` and
+//! `client-key.pem` are present, the client can present them for mutual TLS
+//! (mTLS) authentication. [`TlsServerConfig`] loads `server-cert.pem` and
+//! `server-key.pem`, and trusts client certificates issued by the CA in
+//! `ca-cert.pem` when that CA file is present. [`TlsStream::new_server`] uses
+//! that configuration to establish the server side of the connection.
 //!
 //! [`TlsStream`] implements [`Read`], [`Write`], [`ReadVolatile`],
 //! [`WriteVolatile`], and [`AsFd`] so it can be used by the transport layer like
@@ -21,10 +22,11 @@
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::os::fd::{AsFd, BorrowedFd};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::result;
 use std::sync::Arc;
 
+use log::info;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, InvalidDnsNameError, PrivateKeyDer, ServerName};
 use rustls::server::{VerifierBuilderError, WebPkiClientVerifier};
@@ -36,6 +38,12 @@ use vm_memory::bitmap::BitmapSlice;
 use vm_memory::{ReadVolatile, VolatileMemoryError, VolatileSlice, WriteVolatile};
 
 use crate::MigratableError;
+
+const CA_CERT_FILE: &str = "ca-cert.pem";
+const CLIENT_CERT_FILE: &str = "client-cert.pem";
+const CLIENT_KEY_FILE: &str = "client-key.pem";
+const SERVER_CERT_FILE: &str = "server-cert.pem";
+const SERVER_KEY_FILE: &str = "server-key.pem";
 
 /// Errors that can occur when establishing a TLS-encrypted migration channel.
 #[derive(Error, Debug)]
@@ -57,6 +65,14 @@ pub enum TlsError {
 
     #[error("Error handling PEM file")]
     RustlsPemError(#[from] rustls::pki_types::pem::Error),
+
+    #[error(
+        "Incomplete TLS client authentication configuration: expected both {cert_path:?} and {key_path:?} to exist, or neither"
+    )]
+    IncompleteClientAuthConfig {
+        cert_path: PathBuf,
+        key_path: PathBuf,
+    },
 }
 
 /// Wraps the concrete rustls stream for either side (server or client) of the
@@ -88,23 +104,36 @@ impl TlsStream {
     /// Creates a client [`TlsStream`].
     ///
     /// The client verifies the server certificate against `ca-cert.pem` and the
-    /// provided `hostname`, and presents the certificate chain in
-    /// `client-cert.pem` together with the private key in `client-key.pem` for
-    /// mutual TLS authentication.
+    /// provided `hostname`. If `client-cert.pem` and `client-key.pem` are
+    /// present, it can also present them for mutual TLS authentication.
     pub fn new_client(
         socket: TcpStream,
         cert_dir: &Path,
         hostname: &str,
     ) -> result::Result<Self, MigratableError> {
-        let root_store = load_root_store(&cert_dir.join("ca-cert.pem"))?;
-        let client_certs = load_cert_chain(&cert_dir.join("client-cert.pem"))?;
-        let client_key = load_private_key(&cert_dir.join("client-key.pem"))?;
+        let root_store = load_root_store(&cert_dir.join(CA_CERT_FILE))?;
+        let client_auth_config = client_auth_config(cert_dir)?;
+        let config_builder = ClientConfig::builder().with_root_certificates(root_store);
+        let (config, mtls) = match client_auth_config {
+            ClientAuthConfig::MutualTls {
+                cert_path,
+                key_path,
+            } => {
+                let client_certs = load_cert_chain(&cert_path)?;
+                let client_key = load_private_key(&key_path)?;
+                let config = config_builder
+                    .with_client_auth_cert(client_certs, client_key)
+                    .map_err(TlsError::RustlsError)
+                    .map_err(MigratableError::Tls)?;
 
-        let config = ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_client_auth_cert(client_certs, client_key)
-            .map_err(TlsError::RustlsError)
-            .map_err(MigratableError::Tls)?;
+                (config, true)
+            }
+            ClientAuthConfig::NormalTls => (config_builder.with_no_client_auth(), false),
+        };
+        info!(
+            "Using {} for migration client connection",
+            if mtls { "mTLS" } else { "normal TLS" }
+        );
         let config = Arc::new(config);
 
         let server_name = ServerName::try_from(hostname.to_string())
@@ -285,29 +314,65 @@ pub struct TlsServerConfig {
 
 impl TlsServerConfig {
     /// Creates a [`TlsServerConfig`] from the certificate chain in
-    /// `server-cert.pem`, the private key in `server-key.pem`, and the client
-    /// trust anchors in `ca-cert.pem`.
+    /// `server-cert.pem` and the private key in `server-key.pem`.
     ///
-    /// Client certificates presented during the TLS handshake must chain to a CA in
-    /// `ca-cert.pem`.
+    /// If `ca-cert.pem` is present, client certificates presented during the TLS
+    /// handshake must chain to that CA.
     pub fn new(cert_dir: &Path) -> result::Result<Self, MigratableError> {
-        let server_certs = load_cert_chain(&cert_dir.join("server-cert.pem"))?;
-        let server_key = load_private_key(&cert_dir.join("server-key.pem"))?;
-        // Trust anchors used to verify client certificates for mTLS.
-        let client_roots = Arc::new(load_root_store(&cert_dir.join("ca-cert.pem"))?);
+        let server_certs = load_cert_chain(&cert_dir.join(SERVER_CERT_FILE))?;
+        let server_key = load_private_key(&cert_dir.join(SERVER_KEY_FILE))?;
+        let ca_cert_path = cert_dir.join(CA_CERT_FILE);
+        let config_builder = ServerConfig::builder();
+        let (config_builder, mtls) = if ca_cert_path.is_file() {
+            let client_roots = Arc::new(load_root_store(&ca_cert_path)?);
+            let client_verifier = WebPkiClientVerifier::builder(client_roots)
+                .build()
+                .map_err(TlsError::RustlsVerifierBuilderError)
+                .map_err(MigratableError::Tls)?;
 
-        let client_verifier = WebPkiClientVerifier::builder(client_roots)
-            .build()
-            .map_err(TlsError::RustlsVerifierBuilderError)
-            .map_err(MigratableError::Tls)?;
-
-        let config = ServerConfig::builder()
-            .with_client_cert_verifier(client_verifier)
+            (
+                config_builder.with_client_cert_verifier(client_verifier),
+                true,
+            )
+        } else {
+            (config_builder.with_no_client_auth(), false)
+        };
+        let config = config_builder
             .with_single_cert(server_certs, server_key)
             .map_err(TlsError::RustlsError)
             .map_err(MigratableError::Tls)?;
+        info!(
+            "Using {} for migration server connection",
+            if mtls { "mTLS" } else { "normal TLS" }
+        );
         let config = Arc::new(config);
         Ok(Self { config })
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum ClientAuthConfig {
+    MutualTls {
+        cert_path: PathBuf,
+        key_path: PathBuf,
+    },
+    NormalTls,
+}
+
+fn client_auth_config(cert_dir: &Path) -> result::Result<ClientAuthConfig, MigratableError> {
+    let cert_path = cert_dir.join(CLIENT_CERT_FILE);
+    let key_path = cert_dir.join(CLIENT_KEY_FILE);
+
+    match (cert_path.is_file(), key_path.is_file()) {
+        (true, true) => Ok(ClientAuthConfig::MutualTls {
+            cert_path,
+            key_path,
+        }),
+        (false, false) => Ok(ClientAuthConfig::NormalTls),
+        _ => Err(MigratableError::Tls(TlsError::IncompleteClientAuthConfig {
+            cert_path,
+            key_path,
+        })),
     }
 }
 
@@ -343,4 +408,68 @@ fn load_private_key(key_path: &Path) -> result::Result<PrivateKeyDer<'static>, M
     PrivateKeyDer::from_pem_file(key_path)
         .map_err(TlsError::RustlsPemError)
         .map_err(MigratableError::Tls)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+
+    use super::*;
+
+    fn temp_test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "cloud-hypervisor-tls-test-{}-{name}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn client_auth_config_uses_normal_tls_without_client_credentials() {
+        let dir = temp_test_dir("no-client-credentials");
+
+        assert_eq!(
+            client_auth_config(&dir).unwrap(),
+            ClientAuthConfig::NormalTls
+        );
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn client_auth_config_uses_mtls_with_client_credentials() {
+        let dir = temp_test_dir("client-credentials");
+        let cert_path = dir.join(CLIENT_CERT_FILE);
+        let key_path = dir.join(CLIENT_KEY_FILE);
+        fs::write(&cert_path, "").unwrap();
+        fs::write(&key_path, "").unwrap();
+
+        assert_eq!(
+            client_auth_config(&dir).unwrap(),
+            ClientAuthConfig::MutualTls {
+                cert_path,
+                key_path
+            }
+        );
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn client_auth_config_rejects_partial_client_credentials() {
+        let dir = temp_test_dir("partial-client-credentials");
+        fs::write(dir.join(CLIENT_CERT_FILE), "").unwrap();
+
+        assert!(matches!(
+            client_auth_config(&dir),
+            Err(MigratableError::Tls(
+                TlsError::IncompleteClientAuthConfig { .. }
+            ))
+        ));
+
+        fs::remove_dir_all(dir).unwrap();
+    }
 }

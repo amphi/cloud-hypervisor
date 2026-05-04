@@ -284,7 +284,9 @@ pub struct VmCoredumpData {
 pub struct VmReceiveMigrationData {
     /// URL for the reception of migration state
     pub receiver_url: String,
-    /// Directory containing the TLS server certificate (server-cert.pem), the TLS server key (server-key.pem), and the client TLS root CA certificate (ca-cert.pem).
+    /// Directory containing the TLS server certificate (server-cert.pem), the TLS server key
+    /// (server-key.pem), and the optional client TLS root CA certificate
+    /// (ca-cert.pem) for mutual TLS (mTLS).
     #[serde(default)]
     pub tls_dir: Option<PathBuf>,
     /// Map with new network FDs on the new host.
@@ -499,7 +501,9 @@ pub struct VmSendMigrationData {
     /// Must be between 1 and `MAX_MIGRATION_CONNECTIONS` inclusive.
     #[serde(default = "VmSendMigrationData::default_connections")]
     pub connections: NonZeroU32,
-    /// Path to the directory containing the TLS root CA certificate (ca-cert.pem), the TLS client certificate (client-cert.pem), and TLS client key (client-key.pem).
+    /// Path to the directory containing the TLS root CA certificate (ca-cert.pem),
+    /// and optionally the TLS client certificate (client-cert.pem) and TLS client key
+    /// (client-key.pem) for mutual TLS (mTLS).
     #[serde(default)]
     pub tls_dir: Option<PathBuf>,
     /// Keep the VMM alive.
