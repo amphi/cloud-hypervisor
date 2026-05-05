@@ -2789,7 +2789,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "itertools",
- "log",
  "rustls",
  "serde",
  "serde_json",
