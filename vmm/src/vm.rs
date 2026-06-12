@@ -3128,10 +3128,11 @@ impl Vm {
     }
 
     pub fn memory_range_table(&self) -> std::result::Result<MemoryRangeTable, MigratableError> {
-        self.memory_manager
+        Ok(self
+            .memory_manager
             .lock()
             .unwrap()
-            .memory_range_table(false)
+            .memory_range_table(false))
     }
 
     pub fn guest_memory(&self) -> GuestMemoryAtomic<GuestMemoryMmap> {

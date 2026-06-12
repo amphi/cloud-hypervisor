@@ -2565,10 +2565,7 @@ impl MemoryManager {
         &mut self.memory_zones
     }
 
-    pub fn memory_range_table(
-        &self,
-        snapshot: bool,
-    ) -> std::result::Result<MemoryRangeTable, MigratableError> {
+    pub fn memory_range_table(&self, snapshot: bool) -> MemoryRangeTable {
         let mut table = MemoryRangeTable::default();
 
         for memory_zone in self.memory_zones.values() {
@@ -2601,7 +2598,7 @@ impl MemoryManager {
             }
         }
 
-        Ok(table)
+        table
     }
 
     pub fn snapshot_data(&self) -> MemoryManagerSnapshotData {
@@ -3082,7 +3079,7 @@ impl Snapshottable for MemoryManager {
     }
 
     fn snapshot(&mut self) -> result::Result<Snapshot, MigratableError> {
-        let memory_ranges = self.memory_range_table(true)?;
+        let memory_ranges = self.memory_range_table(true);
 
         // Store locally this list of ranges as it will be used through the
         // Transportable::send() implementation. The point is to avoid the
