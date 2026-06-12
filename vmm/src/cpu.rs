@@ -74,6 +74,7 @@ use vm_memory::ByteValued;
 #[cfg(feature = "guest_debug")]
 use vm_memory::{Bytes, GuestAddressSpace};
 use vm_memory::{GuestAddress, GuestMemoryAtomic};
+use vm_migration::protocol::MemoryRangeTable;
 use vm_migration::{
     Migratable, MigratableError, Pausable, Snapshot, SnapshotData, Snapshottable, Transportable,
     snapshot_from_id,
@@ -2446,6 +2447,19 @@ impl CpuManager {
         self.signal_vcpus()?;
         self.vcpus_kick_signalled.store(false, Ordering::SeqCst);
 
+        Ok(())
+    }
+
+    pub fn prefault_memory(&self, ranges: &MemoryRangeTable) -> Result<()> {
+        // Do we have to do this for each vCPU?
+        for vcpu in &self.vcpus {
+            let vcpu = vcpu.lock().unwrap();
+            for range in ranges.ranges() {
+                vcpu.vcpu
+                    .prefault_memory(range.gpa, range.length)
+                    .map_err(Error::PrefaultGuestMemory)?;
+            }
+        }
         Ok(())
     }
 }

@@ -2844,6 +2844,32 @@ impl Vm {
             .transpose()
     }
 
+    // If memory pre-faulting is requested and the VM supports it, this function does the VM memory pre-faulting.
+    fn maybe_vm_memory_prefault(&self) -> Result<()> {
+        let requested_prefault = self.config.lock().unwrap().memory.prefault;
+        let vm_supports_prefault = requested_prefault && self.vm.supports_prefault_memory();
+
+        if requested_prefault && !vm_supports_prefault {
+            warn!("Prefaulting memory is requested, but the hypervisor does not support that.");
+            return Ok(());
+        }
+
+        if vm_supports_prefault {
+            let ranges = self
+                .memory_manager
+                .lock()
+                .unwrap()
+                .memory_range_table(false);
+            self.cpu_manager
+                .lock()
+                .unwrap()
+                .prefault_memory(&ranges)
+                .map_err(Error::CpuManager)?;
+        }
+
+        Ok(())
+    }
+
     pub fn boot(&mut self) -> Result<()> {
         trace_scoped!("Vm::boot");
         let current_state = self.state;
@@ -2977,6 +3003,8 @@ impl Vm {
                 .map_err(Error::CpuManager)?;
         }
 
+        self.maybe_vm_memory_prefault()?;
+
         #[cfg(feature = "mshv")]
         {
             self.cpu_manager
@@ -3064,6 +3092,8 @@ impl Vm {
         // TODO for upstreaming probably relevant
         // Advertise new VM location to network switches.
         // self.post_migration_announce();
+
+        self.maybe_vm_memory_prefault()?;
 
         // Now we can start all vCPUs from here.
         self.cpu_manager
