@@ -35,9 +35,9 @@ use kvm_bindings::kvm_create_guest_memfd;
 use kvm_ioctls::{NoDatamatch, VcpuFd, VmFd};
 #[cfg(feature = "sev_snp")]
 use log::debug;
-use log::trace;
 #[cfg(target_arch = "x86_64")]
 use log::warn;
+use log::{info, trace};
 use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::ioctl::ioctl_with_mut_ref;
 use vmm_sys_util::{errno, ioctl_iowr_nr};
@@ -3593,6 +3593,13 @@ impl cpu::Vcpu for KvmVcpu {
             flags: 0,
             padding: [0; 5],
         };
+
+        info!("KVM_PRE_FAULT_MEMORY: {:#x}", KVM_PRE_FAULT_MEMORY());
+
+        info!(
+            "KVM_PRE_FAULT_MEMORY: GPA: {:#x}, SIZE: {:#x}",
+            req.gpa, req.size
+        );
 
         // When KVM_PRE_FAULT_MEMORY returns, the input values are updated to point to
         // the remaining range. If size > 0 on return, the ioctl can be issued again
