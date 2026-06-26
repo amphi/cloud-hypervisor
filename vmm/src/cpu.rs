@@ -2452,6 +2452,7 @@ impl CpuManager {
 
     pub fn prefault_memory(&self, ranges: &MemoryRangeTable) -> Result<()> {
         // Do we have to do this for each vCPU?
+        info!("KVM_PRE_FAULT_MEMORY for {} vCPUs.", self.vcpus.len());
         for vcpu in &self.vcpus {
             let vcpu = vcpu.lock().unwrap();
             for range in ranges.ranges() {
