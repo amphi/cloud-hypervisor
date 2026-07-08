@@ -579,6 +579,36 @@ pub enum PostMigrationLifecycleEvent {
 }
 
 impl RestoreVmShell {
+    pub(crate) fn start_restored_vcpus(&self) -> Result<()> {
+        let requested_prefault = self.config.lock().unwrap().memory.prefault;
+        let vm_supports_prefault = self.vm.supports_prefault_memory();
+
+        if self.cpu_manager.lock().unwrap().vcpus().is_empty() {
+            self.cpu_manager
+                .lock()
+                .unwrap()
+                .create_boot_vcpus(None)
+                .map_err(Error::CpuManager)?;
+        }
+
+        let prefault_ranges = if requested_prefault && vm_supports_prefault {
+            Some(
+                self.memory_manager
+                    .lock()
+                    .unwrap()
+                    .memory_range_table(false),
+            )
+        } else {
+            None
+        };
+
+        self.cpu_manager
+            .lock()
+            .unwrap()
+            .start_restored_vcpus(prefault_ranges)
+            .map_err(Error::CpuManager)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn finish(
         self,
@@ -707,31 +737,6 @@ impl RestoreVmShell {
             vcpu_throttler,
             post_migration_lifecycle_event,
         })
-    }
-
-    pub(crate) fn maybe_vm_memory_prefault(&self) -> Result<()> {
-        let requested_prefault = self.config.lock().unwrap().memory.prefault;
-        let vm_supports_prefault = requested_prefault && self.vm.supports_prefault_memory();
-
-        if requested_prefault && !vm_supports_prefault {
-            warn!("Prefaulting memory is requested, but the hypervisor does not support that.");
-            return Ok(());
-        }
-
-        if vm_supports_prefault {
-            let ranges = self
-                .memory_manager
-                .lock()
-                .unwrap()
-                .memory_range_table(false);
-            self.cpu_manager
-                .lock()
-                .unwrap()
-                .prefault_memory(&ranges)
-                .map_err(Error::CpuManager)?;
-        }
-
-        Ok(())
     }
 
     pub(crate) fn guest_memory(&self) -> GuestMemoryAtomic<GuestMemoryMmap> {
@@ -3113,32 +3118,6 @@ impl Vm {
             .transpose()
     }
 
-    // If memory pre-faulting is requested and the VM supports it, this function does the VM memory pre-faulting.
-    fn maybe_vm_memory_prefault(&self) -> Result<()> {
-        let requested_prefault = self.config.lock().unwrap().memory.prefault;
-        let vm_supports_prefault = requested_prefault && self.vm.supports_prefault_memory();
-
-        if requested_prefault && !vm_supports_prefault {
-            warn!("Prefaulting memory is requested, but the hypervisor does not support that.");
-            return Ok(());
-        }
-
-        if vm_supports_prefault {
-            let ranges = self
-                .memory_manager
-                .lock()
-                .unwrap()
-                .memory_range_table(false);
-            self.cpu_manager
-                .lock()
-                .unwrap()
-                .prefault_memory(&ranges)
-                .map_err(Error::CpuManager)?;
-        }
-
-        Ok(())
-    }
-
     pub fn boot(&mut self) -> Result<()> {
         trace_scoped!("Vm::boot");
         let current_state = self.state;
@@ -3272,8 +3251,6 @@ impl Vm {
                 .map_err(Error::CpuManager)?;
         }
 
-        self.maybe_vm_memory_prefault()?;
-
         #[cfg(feature = "mshv")]
         {
             self.cpu_manager
@@ -3303,6 +3280,25 @@ impl Vm {
         // available after they are configured
         #[cfg(target_arch = "aarch64")]
         let rsdp_addr = self.create_acpi_tables();
+
+        let prefault_ranges = {
+            let requested_prefault = self.config.lock().unwrap().memory.prefault;
+            let vm_supports_prefault = requested_prefault && self.vm.supports_prefault_memory();
+
+            if requested_prefault && !vm_supports_prefault {
+                warn!("Prefaulting memory is requested, but the hypervisor does not support that.");
+                None
+            } else if vm_supports_prefault {
+                Some(
+                    self.memory_manager
+                        .lock()
+                        .unwrap()
+                        .memory_range_table(false),
+                )
+            } else {
+                None
+            }
+        };
 
         #[cfg(not(target_arch = "riscv64"))]
         // Configure shared state based on loaded kernel.
@@ -3341,7 +3337,7 @@ impl Vm {
         self.cpu_manager
             .lock()
             .unwrap()
-            .start_boot_vcpus(new_state == VmState::BreakPoint)
+            .start_boot_vcpus(new_state == VmState::BreakPoint, prefault_ranges)
             .map_err(Error::CpuManager)?;
 
         self.state = new_state;
@@ -3366,7 +3362,7 @@ impl Vm {
         self.cpu_manager
             .lock()
             .unwrap()
-            .start_restored_vcpus()
+            .start_restored_vcpus(None)
             .map_err(Error::CpuManager)?;
 
         event!("vm", "restored");

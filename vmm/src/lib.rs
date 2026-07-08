@@ -1177,10 +1177,6 @@ impl Vmm {
                     receive_data_migration.zones.clone(),
                 )?;
 
-                vm.maybe_vm_memory_prefault().map_err(|e| {
-                    MigratableError::MigrateReceive(anyhow!("Error prefaulting memory: {e:?}"))
-                })?;
-
                 if !receive_data_migration.net_fds.is_empty() {
                     let mut vm_config = self.vm_config.as_mut().unwrap().lock().unwrap();
                     for restored_net in &receive_data_migration.net_fds {
@@ -1194,6 +1190,10 @@ impl Vmm {
                         }
                     }
                 }
+
+                vm.start_restored_vcpus().map_err(|e| {
+                    MigratableError::MigrateReceive(anyhow!("Error starting restored vCPUs: {e:?}"))
+                })?;
 
                 let guest_memory = vm.guest_memory();
                 // Create the additional-connection receiver even in the single-connection case.
@@ -1576,8 +1576,8 @@ impl Vmm {
                     ))
                 })?;
 
-            // Create VM
-            vm.restore().map_err(|e| {
+            // Resume the VM after the state has been received.
+            vm.resume().map_err(|e| {
                 MigratableError::MigrateReceive(anyhow!("Failed restoring the Vm: {e}"))
             })?;
 
