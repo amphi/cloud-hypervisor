@@ -228,6 +228,15 @@ struct GuestRamMapping {
     file_offset: u64,
 }
 
+impl GuestRamMapping {
+    pub fn debug_string(&self) -> String {
+        format!(
+            "slot={} gpa={:#x} size={:#x} zone={} virtio_mem={} file_offset={:#x}",
+            self.slot, self.gpa, self.size, self.zone_id, self.virtio_mem, self.file_offset
+        )
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct ArchMemRegion {
     base: u64,
@@ -1401,6 +1410,7 @@ impl MemoryManager {
     }
 
     pub fn allocate_address_space(&mut self) -> Result<(), Error> {
+        info!("memslot registration path: allocate_address_space()");
         let mut list = Vec::new();
 
         for (zone_id, memory_zone) in self.memory_zones.iter() {
@@ -1431,6 +1441,16 @@ impl MemoryManager {
                         self.log_dirty,
                     )
                 }?;
+
+                info!(
+                    "allocated memslot: zone={} gpa={:#x} size={:#x} slot={} virtio_mem={} mergeable={}",
+                    zone_id,
+                    region.start_addr().raw_value(),
+                    region.len(),
+                    slot,
+                    virtio_mem,
+                    zone_mergeable,
+                );
 
                 let file_offset = if let Some(file_offset) = region.file_offset() {
                     file_offset.start()
@@ -1543,6 +1563,14 @@ impl MemoryManager {
             selected_slot,
             next_hotplug_slot,
         ) = if let Some(data) = restore_data {
+            info!("restore memory manager marker: entering restore_data branch");
+            info!(
+                "restore memory manager snapshot: memory_ranges={} guest_ram_mappings={} arch_mem_regions={} hotplug_slots={}",
+                data.memory_ranges.regions().len(),
+                data.guest_ram_mappings.len(),
+                data.arch_mem_regions.len(),
+                data.hotplug_slots.len(),
+            );
             let (regions, memory_zones) = Self::restore_memory_regions_and_zones(
                 &data.guest_ram_mappings,
                 &zones,
@@ -1754,6 +1782,12 @@ impl MemoryManager {
             thp: config.thp,
         };
 
+        if restore_data.is_some() {
+            info!("restore memory manager: allocating guest address space");
+            memory_manager.allocate_address_space()?;
+            info!("restore memory manager: guest address space allocated");
+        }
+
         Ok(Arc::new(Mutex::new(memory_manager)))
     }
 
@@ -1768,12 +1802,22 @@ impl MemoryManager {
         phys_bits: u8,
         exit_evt: &EventFd,
     ) -> Result<Arc<Mutex<MemoryManager>>, Error> {
+        info!(
+            "restore memory manager: source_url={source_url:?} prefault={prefault} memory_restore_mode={memory_restore_mode:?}"
+        );
         if let Some(source_url) = source_url {
             let mut memory_file_path = url_to_path(source_url).map_err(Error::Restore)?;
             memory_file_path.push(String::from(SNAPSHOT_FILENAME));
 
             let mem_snapshot: MemoryManagerSnapshotData =
                 snapshot.to_state().map_err(Error::Restore)?;
+            info!(
+                "restore memory manager snapshot: memory_ranges={} guest_ram_mappings={} arch_mem_regions={} hotplug_slots={}",
+                mem_snapshot.memory_ranges.regions().len(),
+                mem_snapshot.guest_ram_mappings.len(),
+                mem_snapshot.arch_mem_regions.len(),
+                mem_snapshot.hotplug_slots.len(),
+            );
 
             let mm = MemoryManager::new(
                 vm,
@@ -1786,16 +1830,42 @@ impl MemoryManager {
                 Default::default(),
             )?;
 
+            info!("SKIPPED receiver restore memslot registration path: allocate_address_space()");
+            // mm.lock().unwrap().allocate_address_space()?;
+            info!("SKIPPED receiver restore memslot registration path: complete");
+
+            {
+                let mm = mm.lock().unwrap();
+                info!(
+                    "restore memory manager created: guest_memory_regions={} guest_ram_mappings={}",
+                    mm.guest_memory().memory().iter().count(),
+                    mm.num_guest_ram_mappings(),
+                );
+                for region in mm.guest_memory_region_debug_strings() {
+                    info!("restore memory manager region: {region}");
+                }
+            }
             if memory_restore_mode == MemoryRestoreMode::OnDemand {
+                info!("restore memory manager: using on-demand restore path");
                 mm.lock().unwrap().restore_by_uffd(
                     &memory_file_path,
                     &mem_snapshot.memory_ranges,
                     exit_evt,
                 )?;
             } else {
+                info!("restore memory manager: using eager copy restore path");
                 mm.lock()
                     .unwrap()
                     .fill_saved_regions(memory_file_path, &mem_snapshot.memory_ranges)?;
+            }
+
+            {
+                let mm = mm.lock().unwrap();
+                info!(
+                    "restore memory manager complete: guest_memory_regions={} guest_ram_mappings={}",
+                    mm.guest_memory().memory().iter().count(),
+                    mm.num_guest_ram_mappings(),
+                );
             }
 
             Ok(mm)
@@ -2074,6 +2144,18 @@ impl MemoryManager {
         existing_memory_file: Option<File>,
         thp: bool,
     ) -> Result<Arc<GuestRegionMmap>, Error> {
+        info!(
+            "create ram region: start={:#x} size={:#x} prefault={} shared={} hugepages={} file_offset={:#x} backing_file={:?} existing_memory_file={} thp={}",
+            start_addr.raw_value(),
+            size,
+            prefault,
+            shared,
+            hugepages,
+            file_offset,
+            backing_file,
+            existing_memory_file.is_some(),
+            thp,
+        );
         let r = Self::create_ram_region_raw(
             backing_file,
             file_offset,
@@ -2146,12 +2228,19 @@ impl MemoryManager {
 
     // Update the GuestMemoryMmap with the new range
     fn add_region(&mut self, region: Arc<GuestRegionMmap>) -> Result<(), Error> {
+        info!(
+            "adding guest memory region: start={:#x} len={:#x}",
+            region.start_addr().raw_value(),
+            region.len()
+        );
         let guest_memory = self
             .guest_memory
             .memory()
             .insert_region(region)
             .map_err(Error::GuestRegionCollection)?;
         self.guest_memory.lock().unwrap().replace(guest_memory);
+
+        info!("guest memory region added");
 
         Ok(())
     }
@@ -2187,6 +2276,11 @@ impl MemoryManager {
         start_addr: GuestAddress,
         size: usize,
     ) -> Result<Arc<GuestRegionMmap>, Error> {
+        info!(
+            "adding ram region: start={:#x} size={:#x}",
+            start_addr.raw_value(),
+            size
+        );
         // Allocate memory for the region
         let region = MemoryManager::create_ram_region(
             &None,
@@ -2565,6 +2659,10 @@ impl MemoryManager {
         &mut self.memory_zones
     }
 
+    pub fn prefault(&self) -> bool {
+        self.prefault
+    }
+
     pub fn memory_range_table(&self, snapshot: bool) -> MemoryRangeTable {
         let mut table = MemoryRangeTable::default();
 
@@ -2632,12 +2730,44 @@ impl MemoryManager {
         memory_slot_fds
     }
 
+    pub fn memory_slot_fds_debug_strings(&self) -> Vec<String> {
+        self.memory_slot_fds()
+            .into_iter()
+            .map(|(slot, fd)| format!("slot={slot} fd={fd}"))
+            .collect()
+    }
+
     pub fn acpi_address(&self) -> Option<GuestAddress> {
         self.acpi_address
     }
 
     pub fn num_guest_ram_mappings(&self) -> u32 {
         self.guest_ram_mappings.len() as u32
+    }
+
+    pub fn guest_ram_mappings_debug_strings(&self) -> Vec<String> {
+        self.guest_ram_mappings
+            .iter()
+            .map(GuestRamMapping::debug_string)
+            .collect()
+    }
+
+    pub fn guest_memory_region_debug_strings(&self) -> Vec<String> {
+        self.guest_memory
+            .memory()
+            .iter()
+            .map(|region| {
+                let file_offset = region
+                    .file_offset()
+                    .map_or_else(|| String::from("none"), |f| format!("{:#x}", f.start()));
+                format!(
+                    "start={:#x} len={:#x} flags={:#x} file_offset={file_offset}",
+                    region.start_addr().raw_value(),
+                    region.len(),
+                    region.flags(),
+                )
+            })
+            .collect()
     }
 
     #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]

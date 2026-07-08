@@ -1264,6 +1264,34 @@ impl CpuManager {
         self.vcpus.clone()
     }
 
+    pub fn restore_vcpu_states(&mut self, snapshot: Option<&Snapshot>) -> Result<()> {
+        let Some(snapshot) = snapshot else {
+            return Ok(());
+        };
+
+        info!(
+            "restore vcpu states: applying final snapshot for {} vcpus",
+            self.vcpus.len()
+        );
+
+        for (cpu_id, vcpu) in self.vcpus.iter().enumerate() {
+            let mut vcpu = vcpu.lock().unwrap();
+            let vcpu_snapshot = snapshot_from_id(Some(snapshot), cpu_id.to_string().as_str())
+                .ok_or_else(|| {
+                    Error::VcpuCreate(anyhow!("Could not find snapshot for vCPU {cpu_id}"))
+                })?;
+            let state: CpuState = vcpu_snapshot.to_state().map_err(|e| {
+                Error::VcpuCreate(anyhow!("Could not get vCPU state from snapshot {e:?}"))
+            })?;
+            vcpu.vcpu
+                .set_state(&state)
+                .map_err(|e| Error::VcpuCreate(anyhow!("Could not set the vCPU state {e:?}")))?;
+            vcpu.saved_state = Some(state);
+        }
+
+        Ok(())
+    }
+
     fn start_vcpu(
         &mut self,
         vcpu: Arc<Mutex<Vcpu>>,

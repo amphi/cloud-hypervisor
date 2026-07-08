@@ -56,7 +56,7 @@ use vm_migration::progress::{
 use vm_migration::protocol::*;
 use vm_migration::{
     MemoryMigrationContext, Migratable, MigratableError, OngoingMigrationContext, Pausable,
-    Snapshot, Snapshottable, Transportable,
+    Snapshot, Snapshottable, Transportable, snapshot_from_id,
 };
 use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::signal::unblock_signal;
@@ -1225,6 +1225,11 @@ impl Vmm {
         }
 
         let state_name = state.variant_name();
+        warn!(
+            "Received command {:?} while being in state {}",
+            req.command(),
+            state_name
+        );
         match state {
             Established => match req.command() {
                 Command::Start => Ok(Started),
@@ -1304,7 +1309,9 @@ impl Vmm {
                     // triggered via the eventfds below.
                     match self.received_postponed_lifecycle_event {
                         None => {
+                            warn!("No postponed lifecycle event, resuming VM");
                             let (_, resume_duration) = measure_ok(|| vm.resume())?;
+                            warn!("VM resumed");
                             debug!(
                                 "Migration (incoming): resume:{}ms",
                                 resume_duration.as_millis()
@@ -1557,7 +1564,7 @@ impl Vmm {
             .map_err(MigratableError::MigrateReceive)?;
 
         let (vm, restore_duration) = measure_ok(|| {
-            let mut vm = vm_shell
+            let vm = vm_shell
                 .finish(
                     exit_evt,
                     reset_evt,
@@ -1576,10 +1583,20 @@ impl Vmm {
                     ))
                 })?;
 
-            // Resume the VM after the state has been received.
-            vm.resume().map_err(|e| {
-                MigratableError::MigrateReceive(anyhow!("Failed restoring the Vm: {e}"))
-            })?;
+            info!("receiver restore finalization: applying vcpu snapshot state");
+            vm.restore_vcpu_states(snapshot_from_id(Some(&snapshot), CPU_MANAGER_SNAPSHOT_ID))
+                .map_err(|e| {
+                    MigratableError::MigrateReceive(anyhow!(
+                        "Error restoring vCPU state from snapshot: {e:?}"
+                    ))
+                })?;
+
+            // Resume the VM after the state has been received, unless it is already running.
+            // if vm.get_state() != VmState::Running {
+            //     vm.resume().map_err(|e| {
+            //         MigratableError::MigrateReceive(anyhow!("Failed restoring the Vm: {e}"))
+            //     })?;
+            // }
 
             Ok(vm)
         })?;
@@ -3333,6 +3350,7 @@ impl RequestHandler for Vmm {
         let res: result::Result<ReceiveMigrationState, MigratableError> = loop {
             let req = Request::read_from(&mut socket)?;
             trace!("Command {:?} received", req.command());
+            warn!("Received command {:?}", req.command());
 
             let (response, new_state, mut maybe_error) = match self.vm_receive_migration_step(
                 &mut socket,
@@ -3348,6 +3366,7 @@ impl RequestHandler for Vmm {
                         req.command(),
                         err
                     );
+                    Self::log_print_error_chain(&err);
                     (Response::error(), ReceiveMigrationState::Aborted, Some(err))
                 }
             };

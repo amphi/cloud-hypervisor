@@ -72,11 +72,12 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracer::trace_scoped;
 use vm_device::Bus;
+use vm_memory::{
+    Address, Bytes, GuestAddress, GuestAddressSpace, GuestMemory, GuestMemoryAtomic,
+    GuestMemoryRegion,
+};
 #[cfg(feature = "tdx")]
-use vm_memory::GuestMemory;
-#[cfg(feature = "tdx")]
-use vm_memory::{Address, ByteValued, GuestMemoryRegion, ReadVolatile};
-use vm_memory::{Bytes, GuestAddress, GuestAddressSpace, GuestMemoryAtomic};
+use vm_memory::{ByteValued, ReadVolatile};
 use vm_migration::protocol::{MemoryRangeTable, Request, Response};
 use vm_migration::{
     Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable, snapshot_from_id,
@@ -580,8 +581,14 @@ pub enum PostMigrationLifecycleEvent {
 
 impl RestoreVmShell {
     pub(crate) fn start_restored_vcpus(&self) -> Result<()> {
-        let requested_prefault = self.config.lock().unwrap().memory.prefault;
+        info!("receiver restore phase: start_restored_vcpus()");
+        let requested_prefault = self.memory_manager.lock().unwrap().prefault();
         let vm_supports_prefault = self.vm.supports_prefault_memory();
+        let mapping_count = self.memory_manager.lock().unwrap().num_guest_ram_mappings();
+
+        info!(
+            "restore prefault: requested={requested_prefault} supported={vm_supports_prefault} guest_ram_mappings={mapping_count}"
+        );
 
         if self.cpu_manager.lock().unwrap().vcpus().is_empty() {
             self.cpu_manager
@@ -592,12 +599,33 @@ impl RestoreVmShell {
         }
 
         let prefault_ranges = if requested_prefault && vm_supports_prefault {
-            Some(
-                self.memory_manager
-                    .lock()
-                    .unwrap()
-                    .memory_range_table(false),
-            )
+            let mm = self.memory_manager.lock().unwrap();
+            let guest_memory = mm.guest_memory();
+            let ranges = mm.memory_range_table(false);
+            info!("restore prefault ranges: {ranges:?}");
+            info!(
+                "restore guest memory region count: {}",
+                guest_memory.memory().iter().count()
+            );
+            for region in mm.guest_memory_region_debug_strings() {
+                info!("restore guest memory region: {region}");
+            }
+            for slot in mm.memory_slot_fds_debug_strings() {
+                info!("restore memory slot fd: {slot}");
+            }
+            for mapping in mm.guest_ram_mappings_debug_strings() {
+                info!("restore ram mapping: {mapping}");
+            }
+            match guest_memory.memory().find_region(GuestAddress(0)) {
+                Some(region) => info!(
+                    "restore GPA 0 coverage: covered start={:#x} len={:#x} flags={:#x}",
+                    region.start_addr().raw_value(),
+                    region.len(),
+                    region.flags(),
+                ),
+                None => info!("restore GPA 0 coverage: not covered by guest memory"),
+            }
+            Some(ranges)
         } else {
             None
         };
@@ -623,6 +651,7 @@ impl RestoreVmShell {
         snapshot: Option<&Snapshot>,
     ) -> Result<Vm> {
         trace_scoped!("RestoreVmShell::finish");
+        info!("restore finalization: entering finish() and applying final VM state");
 
         let boot_id_list = self
             .config
@@ -630,6 +659,8 @@ impl RestoreVmShell {
             .unwrap()
             .validate()
             .map_err(Error::ConfigValidation)?;
+
+        info!("restore finalization: creating device manager");
 
         let device_manager = Vm::create_device_manager(
             self.io_bus,
@@ -651,6 +682,9 @@ impl RestoreVmShell {
             snapshot,
         )?;
 
+        info!("restore finalization: device manager created");
+
+        info!("restore finalization: applying hypervisor-specific init");
         let load_payload_handle = Vm::hypervisor_specific_init(
             &self.vm,
             &self.memory_manager,
@@ -665,6 +699,8 @@ impl RestoreVmShell {
             #[cfg(feature = "igvm")]
             self.igvm_file,
         )?;
+
+        info!("restore finalization: hypervisor-specific init complete");
 
         #[cfg(feature = "tdx")]
         let kernel = self
@@ -1253,12 +1289,18 @@ impl Vm {
             )?;
         }
 
-        // Allocate address space for non-SEV-SNP guests
-        memory_manager
-            .lock()
-            .unwrap()
-            .allocate_address_space()
-            .map_err(Error::MemoryManager)?;
+        // Allocate address space for non-SEV-SNP guests.
+        // Restore already registered the memslots when rebuilding the memory manager.
+        if snapshot.is_none() {
+            info!("boot memslot registration path: allocate_address_space()");
+            memory_manager
+                .lock()
+                .unwrap()
+                .allocate_address_space()
+                .map_err(Error::MemoryManager)?;
+        } else {
+            info!("receiver restore finalization: memslots already allocated");
+        }
 
         // Load payload asynchronously
         let load_payload_handle = if snapshot.is_none() {
@@ -3346,6 +3388,7 @@ impl Vm {
 
     pub fn restore(&mut self) -> Result<()> {
         event!("vm", "restoring");
+        info!("receiver resume phase: acquiring disk locks and starting vCPUs");
 
         // We acquire all advisory disk image locks again.
         self.device_manager
@@ -3364,6 +3407,8 @@ impl Vm {
             .unwrap()
             .start_restored_vcpus(None)
             .map_err(Error::CpuManager)?;
+
+        info!("receiver resume phase: vCPUs started");
 
         event!("vm", "restored");
         Ok(())
@@ -3426,6 +3471,14 @@ impl Vm {
             .lock()
             .unwrap()
             .memory_range_table(false))
+    }
+
+    pub fn restore_vcpu_states(&self, snapshot: Option<&Snapshot>) -> Result<()> {
+        self.cpu_manager
+            .lock()
+            .unwrap()
+            .restore_vcpu_states(snapshot)
+            .map_err(Error::CpuManager)
     }
 
     pub fn guest_memory(&self) -> GuestMemoryAtomic<GuestMemoryMmap> {
@@ -3648,6 +3701,8 @@ impl Pausable for Vm {
         let current_state = self.get_state();
         let new_state = VmState::Running;
 
+        warn!("Resuming VM (current state: {current_state:?}, new state: {new_state:?}");
+
         self.state
             .valid_transition(new_state)
             .map_err(|e| MigratableError::Resume(anyhow!("Invalid transition: {e:?}")))?;
@@ -3669,7 +3724,9 @@ impl Pausable for Vm {
                 .map_err(|e| MigratableError::Resume(anyhow!("Could not resume the VM: {e}")))?;
         }
 
+        warn!("Resuming device manager");
         self.device_manager.lock().unwrap().resume()?;
+        warn!("Resuming CPU manager");
         self.cpu_manager.lock().unwrap().resume()?;
 
         // And we're back to the Running state.
