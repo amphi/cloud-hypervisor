@@ -117,6 +117,7 @@ mod kvm {
     pub const KVM_SEV_SNP_LAUNCH_START: u64 = 0x4018_aeb4;
     pub const KVM_SEV_SNP_LAUNCH_UPDATE: u64 = 0x8018_aeb5;
     pub const KVM_SEV_SNP_LAUNCH_FINISH: u64 = 0x4008_aeb7;
+    pub const KVM_PRE_FAULT_MEMORY: u64 = 0xc040_aed5;
 }
 
 mod iommufd {
@@ -254,6 +255,7 @@ fn create_vmm_ioctl_seccomp_rule_common_kvm() -> Result<Vec<SeccompRule>, Backen
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_IOEVENTFD)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_IRQFD)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_RUN)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_PRE_FAULT_MEMORY)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_MEMORY_ENCRYPT_OP)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_DEVICE_ATTR,)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_HAS_DEVICE_ATTR,)?],
@@ -453,7 +455,6 @@ fn create_vmm_ioctl_seccomp_rule_kvm() -> Result<Vec<SeccompRule>, BackendError>
     const KVM_GET_XSAVE: u64 = 0x9000_aea4;
     const KVM_GET_XSAVE2: u64 = 0x9000_aecf;
     const KVM_KVMCLOCK_CTRL: u64 = 0xaead;
-    const KVM_PRE_FAULT_MEMORY: u64 = 0xc000_003e;
     const KVM_SET_CLOCK: u64 = 0x4030_ae7b;
     const KVM_SET_CPUID2: u64 = 0x4008_ae90;
     const KVM_SET_FPU: u64 = 0x41a0_ae8d;
@@ -489,7 +490,6 @@ fn create_vmm_ioctl_seccomp_rule_kvm() -> Result<Vec<SeccompRule>, BackendError>
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_GET_XSAVE,)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_GET_XSAVE2,)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_KVMCLOCK_CTRL)?],
-        and![Cond::new(1, ArgLen::Dword, Eq, KVM_PRE_FAULT_MEMORY)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_CLOCK)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_CPUID2)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_FPU)?],
@@ -788,6 +788,7 @@ fn create_vcpu_ioctl_seccomp_rule_kvm() -> Result<Vec<SeccompRule>, BackendError
             KVM_SET_USER_MEMORY_REGION2,
         )?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_CREATE_GUEST_MEMFD,)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_PRE_FAULT_MEMORY)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_MEMORY_ATTRIBUTES,)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_RUN,)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_NMI)?],
