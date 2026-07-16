@@ -176,10 +176,17 @@ pub struct MemoryZone {
     hugepages: bool,
     backing_page_size: u64,
     mergeable: bool,
+    prefault: bool,
 }
 
 impl MemoryZone {
-    fn new(shared: bool, hugepages: bool, backing_page_size: u64, mergeable: bool) -> Self {
+    fn new(
+        shared: bool,
+        hugepages: bool,
+        backing_page_size: u64,
+        mergeable: bool,
+        prefault: bool,
+    ) -> Self {
         Self {
             regions: Vec::new(),
             virtio_mem_zone: None,
@@ -187,6 +194,7 @@ impl MemoryZone {
             hugepages,
             backing_page_size,
             mergeable,
+            prefault,
         }
     }
 
@@ -198,6 +206,10 @@ impl MemoryZone {
     }
     pub fn virtio_mem_zone_mut(&mut self) -> Option<&mut VirtioMemZone> {
         self.virtio_mem_zone.as_mut()
+    }
+
+    pub fn prefault(&self) -> bool {
+        self.prefault
     }
 
     fn backing_page_size_for_gpa(&self, gpa: u64) -> Option<u64> {
@@ -663,7 +675,13 @@ impl MemoryManager {
         // Add zone id to the list of memory zones.
         memory_zones.insert(
             zone.id.clone(),
-            MemoryZone::new(zone.shared, zone.hugepages, zone_align_size, zone.mergeable),
+            MemoryZone::new(
+                zone.shared,
+                zone.hugepages,
+                zone_align_size,
+                zone.mergeable,
+                zone.prefault,
+            ),
         );
 
         for ram_region in ram_regions.iter() {
@@ -762,6 +780,7 @@ impl MemoryManager {
                             zone.hugepages,
                             zone_align_size,
                             zone.mergeable,
+                            zone.prefault,
                         ),
                     );
                 }
@@ -799,6 +818,7 @@ impl MemoryManager {
                     zone_config.hugepages,
                     zone_page_size,
                     zone_config.mergeable,
+                    zone_config.prefault,
                 ),
             );
         }
@@ -2661,6 +2681,41 @@ impl MemoryManager {
 
     pub fn prefault(&self) -> bool {
         self.prefault
+    }
+
+    pub fn prefault_memory_range_table(&self, snapshot: bool) -> MemoryRangeTable {
+        if self.prefault {
+            return self.memory_range_table(snapshot);
+        }
+
+        let mut table = MemoryRangeTable::default();
+
+        for memory_zone in self.memory_zones.values() {
+            if !memory_zone.prefault() {
+                continue;
+            }
+
+            if let Some(virtio_mem_zone) = memory_zone.virtio_mem_zone() {
+                table.extend(virtio_mem_zone.plugged_ranges());
+            }
+
+            for region in memory_zone.regions() {
+                if snapshot
+                    && let Some(file_offset) = region.file_offset()
+                    && (region.flags() & libc::MAP_SHARED == libc::MAP_SHARED)
+                    && Self::is_hardlink(file_offset.file())
+                {
+                    continue;
+                }
+
+                table.push(MemoryRange {
+                    gpa: region.start_addr().raw_value(),
+                    length: region.len(),
+                });
+            }
+        }
+
+        table
     }
 
     pub fn memory_range_table(&self, snapshot: bool) -> MemoryRangeTable {

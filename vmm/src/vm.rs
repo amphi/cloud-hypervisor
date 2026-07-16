@@ -582,12 +582,18 @@ pub enum PostMigrationLifecycleEvent {
 impl RestoreVmShell {
     pub(crate) fn start_restored_vcpus(&self) -> Result<()> {
         info!("receiver restore phase: start_restored_vcpus()");
-        let requested_prefault = self.memory_manager.lock().unwrap().prefault();
-        let vm_supports_prefault = self.vm.supports_prefault_memory();
+        let (prefault_ranges, vm_supports_prefault) = {
+            let mm = self.memory_manager.lock().unwrap();
+            (
+                mm.prefault_memory_range_table(false),
+                self.vm.supports_prefault_memory(),
+            )
+        };
         let mapping_count = self.memory_manager.lock().unwrap().num_guest_ram_mappings();
 
         info!(
-            "restore prefault: requested={requested_prefault} supported={vm_supports_prefault} guest_ram_mappings={mapping_count}"
+            "restore prefault: requested={} supported={vm_supports_prefault} guest_ram_mappings={mapping_count}",
+            !prefault_ranges.is_empty()
         );
 
         if self.cpu_manager.lock().unwrap().vcpus().is_empty() {
@@ -598,11 +604,10 @@ impl RestoreVmShell {
                 .map_err(Error::CpuManager)?;
         }
 
-        let prefault_ranges = if requested_prefault && vm_supports_prefault {
+        let prefault_ranges = if !prefault_ranges.is_empty() && vm_supports_prefault {
             let mm = self.memory_manager.lock().unwrap();
             let guest_memory = mm.guest_memory();
-            let ranges = mm.memory_range_table(false);
-            info!("restore prefault ranges: {ranges:?}");
+            info!("restore prefault ranges: {prefault_ranges:?}");
             info!(
                 "restore guest memory region count: {}",
                 guest_memory.memory().iter().count()
@@ -625,7 +630,7 @@ impl RestoreVmShell {
                 ),
                 None => info!("restore GPA 0 coverage: not covered by guest memory"),
             }
-            Some(ranges)
+            Some(prefault_ranges)
         } else {
             None
         };
@@ -3324,19 +3329,19 @@ impl Vm {
         let rsdp_addr = self.create_acpi_tables();
 
         let prefault_ranges = {
-            let requested_prefault = self.config.lock().unwrap().memory.prefault;
-            let vm_supports_prefault = requested_prefault && self.vm.supports_prefault_memory();
+            let prefault_ranges = self
+                .memory_manager
+                .lock()
+                .unwrap()
+                .prefault_memory_range_table(false);
+            let vm_supports_prefault =
+                !prefault_ranges.is_empty() && self.vm.supports_prefault_memory();
 
-            if requested_prefault && !vm_supports_prefault {
+            if !prefault_ranges.is_empty() && !vm_supports_prefault {
                 warn!("Prefaulting memory is requested, but the hypervisor does not support that.");
                 None
             } else if vm_supports_prefault {
-                Some(
-                    self.memory_manager
-                        .lock()
-                        .unwrap()
-                        .memory_range_table(false),
-                )
+                Some(prefault_ranges)
             } else {
                 None
             }
