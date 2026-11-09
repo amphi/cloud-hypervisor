@@ -205,6 +205,14 @@ pub struct TlsStream {
     write_buf: Vec<u8>,
 }
 
+fn migration_crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
+    let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+    provider.kx_groups = vec![
+        rustls::crypto::aws_lc_rs::kx_group::X25519MLKEM768,
+    ];
+    Arc::new(provider)
+}
+
 impl TlsStream {
     /// The maximum size of [`TlsStream::write_buf`]. This keeps the reusable buffer
     /// from growing without bound.
@@ -245,7 +253,10 @@ impl TlsStream {
     ) -> result::Result<Self, MigratableError> {
         let root_store = load_root_store(&cert_dir.join(CA_CERT_FILE))?;
 
-        let config = ClientConfig::builder()
+        let config = ClientConfig::builder_with_provider(migration_crypto_provider())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .map_err(TlsError::RustlsError)
+            .map_err(MigratableError::Tls)?
             .with_root_certificates(root_store)
             .with_no_client_auth();
         let config = Arc::new(config);
@@ -445,7 +456,10 @@ impl TlsServerConfig {
         let server_certs = load_cert_chain(&cert_dir.join(SERVER_CERT_FILE))?;
         let server_key = load_private_key(&cert_dir.join(SERVER_KEY_FILE))?;
 
-        let config = ServerConfig::builder()
+        let config = ServerConfig::builder_with_provider(migration_crypto_provider())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .map_err(TlsError::RustlsError)
+            .map_err(MigratableError::Tls)?
             .with_no_client_auth()
             .with_single_cert(server_certs, server_key)
             .map_err(TlsError::RustlsError)
